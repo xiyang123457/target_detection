@@ -5,6 +5,8 @@ import numpy as np               # 组装 boxes/labels 数组
 import cv2                       # 读图 —— 比 PIL 快，且 BGR 顺序正好能练"记得转 RGB"
 import torch                     # 转 tensor —— Dataset 的标准返回类型
 from torch.utils.data import Dataset   # 继承基类 —— 只用它的接口约定，没有实际功能
+import random
+from scripts.augment import hflip,resize,build_train_transform
 
 VOC_CLASSES = [
     "aeroplane", "bicycle", "bird", "boat", "bottle",
@@ -14,10 +16,12 @@ VOC_CLASSES = [
 ]
 
 class VOCDataset(Dataset):
-    def __init__(self, voc_root,split="train",skip_difficult=False):
+    def __init__(self, voc_root,split="train",skip_difficult=False,train = False):
         self.voc_root = voc_root
         self.split = split
         self.skip_difficult = skip_difficult
+        self.train = train #数据增强开关
+        self.transform = build_train_transform() if train else None
 
         # 参数 voc_root: str，VOC2012 根目录
         #   例：r"D:\target_detection\data\VOCdevkit\VOC2012"
@@ -102,14 +106,26 @@ class VOCDataset(Dataset):
     #给定下标idx，返回图像和标签
     def __getitem__(self,idx):
         stem = self.stems[idx]
+        
         #读图，imread返回[H,W,3]
         #注意：cv2读出来的是BGR顺序，不是RGB
         img_path = os.path.join(self.jpeg_dir, f"{stem}.jpg")
         img = cv2.imread(img_path)
         
-        #四个转换
         #BGR->RGB
         img = cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+
+        #读标签
+        boxes,labels = self._parse_xml(stem)
+        #只在训练时做增强
+        # albumentations 要 list 进、list 出；format=pascal_voc 对应我们的 [x1,y1,x2,y2]
+        if self.train:
+            out = self.transform(image = img,bboxes = boxes.tolist(),labels = labels.tolist())
+            img = out["image"]
+            boxes = np.array(out["bboxes"],dtype=np.float32).reshape(-1,4)
+            labels = np.array(out["labels"],dtype=np.int64)
+
+
         #转换成float32 
         img = img.astype(np.float32)
         #归一化到0~1
@@ -118,9 +134,9 @@ class VOCDataset(Dataset):
         img = img.transpose(2,0,1)
         #转换成torch tensor
         img = torch.from_numpy(img)
-
-        #读标签
-        boxes,labels = self._parse_xml(stem)
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(labels, dtype=torch.int64)
+      
         #返回
         return img,{"boxes":boxes,"labels":labels}
         
