@@ -1,3 +1,10 @@
+import os
+
+# 关掉 albumentations 的"联网检查更新"：它 import 时会请求 pypi.org，
+# 网络超时/失败会让整个 import 崩掉。官方开关 NO_ALBUMENTATIONS_UPDATE=1 直接跳过。
+# 【必须在 import albumentations 之前设置】
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
 import cv2
 import numpy as np
 import albumentations as A
