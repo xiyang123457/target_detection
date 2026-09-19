@@ -140,3 +140,14 @@ class VOCDataset(Dataset):
         #返回
         return img,{"boxes":boxes,"labels":labels}
         
+def collate_fn(batch):
+    """把 list[(img, target)] 打包成 (images, targets)。
+
+    batch:   list[(img, target)]，长度 = batch_size
+    返回:    (images, targets)，两个长度都 = batch_size
+      images:  list[Tensor]，每个 [3, H, W]（H/W 可各不相同）
+      targets: list[dict]，每个含 boxes[N,4] / labels[N]（N 可各不相同）
+    """
+    images,targets = zip(*batch)
+    return list(images),list(targets)
+
