@@ -1,0 +1,10 @@
+# 依赖（版本已钉死，R6）
+# torch / torchvision 需按 CUDA 版本安装（RTX 5060 是 sm_120，需 cu128+）：
+#   pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu130
+torch==2.9.0
+torchvision==0.24.0
+albumentations==2.0.8
+numpy==2.2.6
+opencv-python==5.0.0
+torchmetrics==1.9.0
+matplotlib==3.10.9
