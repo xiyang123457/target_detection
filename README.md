@@ -2,7 +2,7 @@
 
 > 在 Pascal VOC 2012（train 5717 图 / 15774 框 / 20 类）上，把 COCO 预训练的 Faster R-CNN 换成 21 类头微调，走通「数据 → 增强 → 训练 → 评估」完整链路。
 
-**结论**：COCO 预训练 Faster R-CNN 微调 5 epoch（中间结果，未收敛），val **mAP@0.5 ≈ 0.71**（1 种子，方差未知；mAP@0.5:0.95 ≈ 0.43）；最强类 bus 0.626，最弱类 pottedplant 0.234。完整实验记录见 [result.md](./result.md)。
+**结论**：COCO 预训练 Faster R-CNN 微调 5 epoch（中间结果，未收敛），val **mAP@0.5 ≈ 0.71**（1 种子，方差未知；mAP@0.5:0.95 ≈ 0.43）；逐类最强 bus 0.626、最弱 pottedplant 0.234（此两者口径为 AP@0.5:0.95，非 AP@0.5）。完整实验记录见 [result.md](./result.md)。
 
 ![demo](assets/demo.png)
 *预测可视化：绿框 = GT，红框 = 预测（Faster R-CNN 微调 5 epoch，conf ≥ 0.5）。*
@@ -13,7 +13,7 @@
 |---|---|---|---|---|---|
 | VOC 微调 5 epoch（中间结果） | **≈0.71** | ≈0.43 | 41.2 M | 34 min | 1 |
 
-> 单次实验（1 种子）。多种子方差、逐类 AP 见 result.md 第 4 节。
+> 单次实验（1 种子）。多种子方差、逐类 AP@0.5:0.95（注意不是 AP@0.5）见 result.md 第 4 节。
 
 ## 我做了什么
 
@@ -22,7 +22,7 @@
 - `scripts/VOC_dataset.py` —— 自写 VOC XML → tensor 的 `Dataset` + `collate_fn`。处理了坐标 1-based（`-1`）、类别编号（背景占 0，`+1`）、`findall` 而非 `iter`（避免钻 `<part>` 多出 3073 个假框）、空图返回 `(0,4)`。
 - `scripts/augment.py` —— 先手写水平翻转/缩放公式验证「框同步」，再封装成 albumentations 流水线（`pascal_voc` + `label_fields`）。
 - `scripts/train.py` —— 训练循环：换 21 类头（动态取 `in_features=1024`）、`model.train()` 语义、4 个 loss 分量拆分打印、checkpoint、loss 历史落盘。
-- `scripts/evaluate.py` —— 验证循环 + torchmetrics 算 mAP（含每类 AP）+ 预测可视化。
+- `scripts/evaluate.py` —— 验证循环 + torchmetrics 算 mAP（每类 AP 同时给 AP@0.5 与 AP@0.5:0.95 两个口径）+ 指标落盘 + 预测可视化。
 - `scripts/VOC_detect.py` —— 数据集体检（类别/密度/尺度三个分布）。
 
 **我没有改动的部分**：模型结构、loss 函数、优化器 —— 直接使用官方实现，只替换分类头，未做魔改。
@@ -78,12 +78,13 @@ python scripts/evaluate.py     # 评估（mAP + 可视化）
 cd /d/target_detection
 python scripts/train.py        # 5 epoch，约 34 min
 python scripts/plot_loss.py    # → outputs/loss_curve.png
-python scripts/evaluate.py     # val 5823 张：mAP + 每类 AP + 预测图
+python scripts/evaluate.py     # 默认只跑前 1000 张（QUICK_N）：mAP + 每类 AP + 预测图
 ```
 
 - 随机种子：默认（未固定，见 result.md 第 7 节）
-- 单次耗时：训练 6.8 min/epoch × 5 ≈ 34 min；评估约 15 min
-- 日志与权重：`runs/train.out.log`、`runs/loss_history.json`、`runs/fasterrcnn_*.pth`
+- 单次耗时：训练 6.8 min/epoch × 5 ≈ 34 min；评估全量 5823 张约 15 min（子集 1000 张约 1.5 min）
+- 评估规模：改 `scripts/evaluate.py` 顶部的 `QUICK_N`，设为 `None` 即跑全量
+- 日志与权重：`runs/train.out.log`、`runs/loss_history_{mode}.json`、`runs/fasterrcnn_*.pth`、`runs/metrics_{mode}_e{epoch}_n{张数}.json`
 
 ## 已知限制
 

@@ -71,9 +71,12 @@
 
 > 第一个 step 的 classifier ≈ 3.24（≈ ln 21），证明新分类头随机初始化正确；epoch 平均即降到 0.17，说明预训练特征强、新头收敛极快。
 
-### 4.3 逐类 AP（val 5823 张）
+### 4.3 逐类 AP@0.5:0.95（val 5823 张，5 epoch 全量微调）
 
-| 类 | AP | 类 | AP |
+> 口径提醒：这一列是 **AP@0.5:0.95**（20 类均值 = 0.434，正好等于 4.1 的 mAP@0.5:0.95 ≈ 0.43），
+> 不是 AP@0.5（同一类的 AP@0.5 会明显更高）。早期版本把它标成了 "AP"，容易和 4.1 的 mAP@0.5 = 0.714 混着看。
+
+| 类 | AP@0.5:0.95 | 类 | AP@0.5:0.95 |
 |---|---|---|---|
 | aeroplane | 0.554 | dog | 0.418 |
 | bicycle | 0.439 | horse | 0.491 |
@@ -86,7 +89,7 @@
 | chair | 0.314 | tvmonitor | 0.430 |
 | cow | 0.387 | diningtable | 0.302 |
 
-图：`assets/fig_ap_by_class.png`（排序条形图）、`assets/fig_ap_vs_instances.png`（实例数 vs AP）。
+图：`assets/fig_ap_by_class.png`（排序条形图）、`assets/fig_ap_vs_instances.png`（实例数 vs AP）——两张图均为 AP@0.5:0.95 口径，由 `scripts/plot_analysis.py` 生成。
 
 ## 5. 分析
 
@@ -94,10 +97,11 @@
 - 预训练 backbone 特征强：新分类头第一个 epoch 内 loss 从 3.0 降到 0.17。
 - 只换头、不动 RPN：`loss_objectness` 初始即 0.02，证明 RPN 保留了 COCO 学到的「物体性」。
 
-### 5.2 错误分析（逐类）
+### 5.2 错误分析（逐类，口径 AP@0.5:0.95）
 - 强项：外形统一、体积大（bus 0.626 / aeroplane 0.554 / sheep 0.540 / train 0.525）
 - 弱项：室内小物体 + 多姿态/遮挡（pottedplant 0.234 / diningtable 0.302 / chair 0.314 / sofa 0.330）
 - person 0.508：姿态/遮挡/尺度变化最多
+- 注意：本节数字与 4.3 同口径，只能做【类间横比】，不要和 4.1 的 mAP@0.5 = 0.714 直接比较
 
 ### 5.3 与文献对比
 - 论文 VOC 报 0.73（VOC 11 点口径 + 6 epoch + 多卡大 lr）。本项目 ≈0.71 是 **pycocotools 101 点口径**（系统性偏低 1-3 点），不能直接等号比较。
@@ -113,7 +117,8 @@
 | 类别 id 与背景错位 | 忘 `+1` 时 loss 看着正常但学不会 | `_parse_xml` 里已 `+1` |
 | 评估忘了 model.eval() | 会让 mAP 异常 | evaluate.py 显式 `eval() + no_grad` |
 | 增强时框没跟着变换 | 手写 resize 曾把 w/h 传反 → 图被拉伸 | 已改，且每步画图验证 |
-| 只看 mAP 不看分类别 AP | 总 mAP 掩盖了 pottedplant 0.234 | 已打印并分析每类 AP |
+| 只看 mAP 不看分类别 AP | 总 mAP 掩盖了 pottedplant 0.234 | 已打印并分析每类 AP@0.5:0.95 |
+| 逐类 AP 标错口径 | 把 `map_per_class` 当成 AP@0.5，还会和 mAP@0.5 混着比 | 代码改成同时输出两个口径；文档与图表统一标注 AP@0.5:0.95 |
 
 **任务书没预警、我额外踩到的**：
 
@@ -135,21 +140,21 @@
 cd /d/target_detection
 python scripts/train.py
 python scripts/plot_loss.py
-python scripts/evaluate.py
+python scripts/evaluate.py      # 注意：脚本顶部 QUICK_N=1000，默认只跑前 1000 张子集
 ```
 
 - 随机种子：默认（未固定）—— 复现性短板
 - 训练日志：`runs/train.out.log`
-- loss 历史：`runs/loss_history.json`
-- 指标输出：`runs/metrics.json`
-- Checkpoint：`runs/fasterrcnn_resnet50_fpn_voc_epoch*.pth`
-- 总耗时：训练约 34 min + 评估约 15 min
+- loss 历史：`runs/loss_history_{mode}.json`
+- 指标输出：`runs/metrics_{mode}_e{epoch}_n{张数}.json` / `.csv`——**文件名带张数**：`n1000` 是子集，`n5823` 才是全量；本章 4.1/4.3 的数字是全量
+- Checkpoint：`runs/fasterrcnn_resnet50_fpn_voc_{mode}_epoch*.pth`
+- 总耗时：训练约 34 min + 评估（全量 5823 张）约 15 min
 
 ## 8. 结论与局限
 
 ### 8.1 数据支持的结论
 - COCO 预训练 Faster R-CNN 换 21 类头 + 微调 5 epoch，VOC val mAP@0.5 ≈ 0.71。这是 5 epoch 的中间结果（loss 仍在下降、未收敛），只能支持「链路通、数字落在合理区间」，不能据此判定「优秀」。
-- 长尾差异明显：bus 0.626 vs pottedplant 0.234（差 0.39）。
+- 长尾差异明显：bus 0.626 vs pottedplant 0.234（差 0.39；口径 AP@0.5:0.95）。
 - 工程链路整体正确，多个「框同步」陷阱已排除。
 
 ### 8.2 数据不支持的（我不敢说的）
