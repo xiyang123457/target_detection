@@ -5,6 +5,10 @@ import os
 import json
 import re
 import time
+import random
+import argparse
+from datetime import datetime
+import numpy as np
 from torch.utils.data import DataLoader
 from scripts.VOC_dataset import VOCDataset, collate_fn
 import torch
@@ -17,21 +21,86 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 ROOT = r"D:\target_detection\data\VOCdevkit\VOC2012"
 RUNS = r"D:\target_detection\runs"
 
-NUM_EPOCHS = 10            #本次运行要训的轮数：从 epoch9 训到 epoch18（续训时从 checkpoint 的轮次往后接着编号）
-BATCH_SIZE = 4
-LR = 0.001
+# ---- 本次运行的默认配置（都可用命令行覆盖，例：python scripts/train.py --mode full --lr 0.005）----
+# 训练范围（本次实验的核心变量）：
+#   "head"       —— 只训新的 21 类分类头，backbone / FPN / RPN / box_head 全冻结（lr=0.001，9/20 已跑）
+#   "head_lr5e3" —— 同上，但 lr=0.005，与 full 对齐，专门用来做【单变量对照】
+#   "full"       —— 全量微调，即 9/19 跑的那套（lr=0.005）
+# ⚠️ 模式名会写进 ckpt 与 loss 历史的文件名（..._voc_{mode}_epoch{N}.pth / loss_history_{mode}.json），
+#    换一组对照必须换名字 —— 复用 "head" 会把 9/20 那批 lr=0.001 的权重和曲线直接覆盖掉。
+DEFAULT_MODE   = "head_lr5e3"
+DEFAULT_LR     = 0.005      # 与 full 那次一致：旧 head 用的 0.001 是混淆变量，本次对齐掉
+DEFAULT_EPOCHS = 18         # 与 full 的 epoch 0-18 对齐
+DEFAULT_BATCH  = 4
+DEFAULT_SEED   = 42         # 固定后：新分类头初始化 / 每轮数据顺序 / 增强随机性都可复现
+DEFAULT_RESUME = None       # None = 从 COCO 预训练权重重新开始（对照实验必须从头跑，不能热启动）
 
-#训练范围（本次实验的核心变量）：
-#   "head" —— 只训新的 21 类分类头，backbone / FPN / RPN / box_head 全部冻结
-#   "full" —— 全量微调，即之前跑的那套
-TRAIN_MODE = "head"
+def parse_args():
+    """把超参从"改代码"变成"改命令行"。
 
-#接着某个权重继续训：填 checkpoint 的完整路径；None = 从 COCO 预训练权重重新开始
-#   例：RESUME_CKPT = os.path.join(RUNS, "fasterrcnn_resnet50_fpn_voc_head_epoch2.pth")
-#   注意：权重文件里只有模型参数，没有优化器动量、也没有已训轮数，
-#        所以这是"热启动"（warm start），不是逐 bit 的断点续训。
-#        好处是：可以跨模式用 —— 比如拿 full 训到一半的权重，冻结后只训头。
-RESUME_CKPT = os.path.join(RUNS, "fasterrcnn_resnet50_fpn_voc_head_epoch8.pth")
+    为什么必须参数化：本轮要做多组对照（full / head_lr5e3 / 旧 head 参考），
+    超参写死在文件里的话，每换一组就得改一次源码、跑完还得改回来，
+    而报告里的"实验设置表"根本无从追溯当时到底用了哪组值。
+    """
+    ap = argparse.ArgumentParser(description="VOC 微调训练（head / head_lr5e3 / full）")
+    ap.add_argument("--mode",       default=DEFAULT_MODE, help=f"训练范围（默认 {DEFAULT_MODE}）")
+    ap.add_argument("--lr",         type=float, default=DEFAULT_LR)
+    ap.add_argument("--epochs",     type=int,   default=DEFAULT_EPOCHS)
+    ap.add_argument("--batch-size", type=int,   default=DEFAULT_BATCH, dest="batch_size")
+    ap.add_argument("--seed",       type=int,   default=DEFAULT_SEED)
+    ap.add_argument("--resume",     default=DEFAULT_RESUME,
+                    help="接着某个权重继续训：填 ckpt 完整路径；None = 从 COCO 预训练权重重新开始")
+    return ap.parse_args()
+
+
+def set_seed(seed):
+    """固定随机性。三处来源都得管：
+
+    random / np.random —— albumentations 的增强（翻不翻转、缩放多少）走 numpy
+    torch             —— 新分类头的随机初始化、以及 DataLoader 的 shuffle 顺序
+
+    只在进程开头调一次；训练中途不要重置，否则每轮的数据顺序会重复。
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"已固定随机种子 seed={seed}")
+
+
+def save_config(args, start_epoch, n_train, n_total, n_images):
+    """把本次运行的超参落盘到 runs/train_config_{mode}.json。
+
+    为什么单独存一个文件而不是塞进 loss_history：
+    loss_history 是 list[dict]，plot_loss 会逐条校验 epoch + 4 个 loss 字段，
+    往里混进一条没有 loss 的记录会直接把画图脚本搞崩。
+    报告里的"实验设置表"一律从这个文件取数，不手抄。
+    """
+    os.makedirs(RUNS, exist_ok=True)
+    cfg = {
+        "mode": args.mode,
+        "lr": args.lr,
+        "epochs": args.epochs,
+        "epoch_from": start_epoch,
+        "epoch_to": start_epoch + args.epochs - 1,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "resume": args.resume,
+        "optimizer": "SGD(momentum=0.9, weight_decay=0.0005)",
+        "min_size": 480,
+        "max_size": 800,
+        "train_images": n_images,
+        "trainable_params": n_train,
+        "total_params": n_total,
+        "torch": torch.__version__,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    path = os.path.join(RUNS, f"train_config_{args.mode}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    print(f"配置已存 {path}")
+    return path
+
 
 def resume_start_epoch(ckpt_path):
     """从权重文件名里解析出它训到了第几轮，续训时接着往后编号。
@@ -67,7 +136,10 @@ def set_trainable(model,mode):
       下面优化器里的 `if p.requires_grad` 看着像"只训放开的那部分"，
       但只要没有代码去把它设成 False，这个过滤条件就等于没过滤。
     """
-    if mode == "head":
+    # 用 startswith("head") 而不是 == "head"：
+    # 冻结范围只由"是不是只训头"决定，与 lr 无关 —— head_lr5e3 / head_lr1e3 都应走同一分支，
+    # 否则每加一个 lr 档就要在这儿加一个 elif，漏一个就会静默变成全量微调（最难查的那类 bug）。
+    if mode.startswith("head"):
         #先全部冻结，再只放开新分类头 —— 相当于在 COCO 特征上做线性探针
         for p in model.parameters():
             p.requires_grad = False
@@ -77,34 +149,45 @@ def set_trainable(model,mode):
         #保持原样：torchvision 默认冻结 conv1+layer1，其余全部可训练
         pass
     else:
-        raise ValueError(f"未知 TRAIN_MODE: {mode}（可选 'head' / 'full'）")
+        raise ValueError(f"未知 TRAIN_MODE: {mode}（可选 'head*' / 'full'）")
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     print(f"TRAIN_MODE={mode} | 可训练参数 {n_train:,} / {n_total:,}（{n_train / n_total:.2%}）")
-    return model
+    return model, n_train, n_total
 
-def train():
+def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(RUNS, exist_ok=True)
+    set_seed(args.seed)      # 必须在建模型（新头随机初始化）和建 DataLoader 之前
+
     ds_train = VOCDataset(ROOT,split="train",train=True)
-    loader = DataLoader(ds_train,batch_size=BATCH_SIZE,shuffle=True,num_workers=0,collate_fn=collate_fn,pin_memory=True)     # 有 GPU 时加速内存→显存拷贝
+    # 给 DataLoader 一个独立的 generator：这样"每轮数据顺序"只由 seed 决定，
+    # 不受前面任何随机操作（如新头初始化）消耗了多少全局随机数的影响 —— 否则换一次模型就换一次数据顺序。
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    loader = DataLoader(ds_train,batch_size=args.batch_size,shuffle=True,num_workers=0,
+                        collate_fn=collate_fn,pin_memory=True,generator=g)   # 有 GPU 时加速内存→显存拷贝
     print(f"训练集 {len(ds_train)} 张  |  device = {device}")
 
     #模型与优化器
     model = build_model(device=device)
-    model = set_trainable(model,TRAIN_MODE)     #必须在建优化器之前：优化器是按 requires_grad 过滤的
+    model, n_train, n_total = set_trainable(model,args.mode)     #必须在建优化器之前：优化器是按 requires_grad 过滤的
 
     #续训：把之前某轮的权重盖到当前模型上（结构一致，strict 加载即可）
     start_epoch = 0
-    if RESUME_CKPT:
-        model.load_state_dict(torch.load(RESUME_CKPT,map_location=device))
-        start_epoch = resume_start_epoch(RESUME_CKPT)
-        print(f"续训：已加载 {RESUME_CKPT}，从 epoch {start_epoch} 接着编号")
+    if args.resume:
+        model.load_state_dict(torch.load(args.resume,map_location=device))
+        start_epoch = resume_start_epoch(args.resume)
+        print(f"续训：已加载 {args.resume}，从 epoch {start_epoch} 接着编号")
     else:
         print("从 COCO 预训练权重开始训练")
 
-    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad],lr =LR,momentum=0.9 ,weight_decay=0.0005) #weight_decay就是l2正则化
+    save_config(args, start_epoch, n_train, n_total, len(ds_train))
+    print(f"本次配置：mode={args.mode} | lr={args.lr} | epochs={args.epochs} | batch={args.batch_size} "
+          f"| seed={args.seed} | epoch 编号 {start_epoch}→{start_epoch + args.epochs - 1}")
+
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad],lr =args.lr,momentum=0.9 ,weight_decay=0.0005) #weight_decay就是l2正则化
 
     #训练模式
     model.train()
@@ -114,15 +197,15 @@ def train():
     # loss_objectness：RPN前景/背景二分类损失
     # loss_rpn_box_reg：RPN候选框坐标回归损失
     #loss 历史：续训时先把之前那段的点读进来，后面每轮追加后再整体写回，曲线保持连续
-    hist_path = os.path.join(RUNS, f"loss_history_{TRAIN_MODE}.json")
+    hist_path = os.path.join(RUNS, f"loss_history_{args.mode}.json")
     history = []
-    if RESUME_CKPT and os.path.exists(hist_path):
+    if args.resume and os.path.exists(hist_path):
         with open(hist_path, "r", encoding="utf-8") as f:
             history = json.load(f)
         print(f"已接上 {hist_path} 里已有的 {len(history)} 个点")
 
     #训练循环
-    for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
+    for epoch in range(start_epoch, start_epoch + args.epochs):
         running = {k: 0 for k in KEYS}
         n = 0           #本epoch 已处理的 step数
         t0 = time.time()
@@ -159,8 +242,8 @@ def train():
               + f" | total={sum(avg.values()):.4f} | {time.time()-t0:.0f}s")
 
         #存checkpoint
-        #   文件名带 TRAIN_MODE：head / full 两套实验的权重不互相覆盖
-        ckpt_path = os.path.join(RUNS, f"fasterrcnn_resnet50_fpn_voc_{TRAIN_MODE}_epoch{epoch}.pth")
+        #   文件名带 mode：head / head_lr5e3 / full 三套实验的权重互不覆盖
+        ckpt_path = os.path.join(RUNS, f"fasterrcnn_resnet50_fpn_voc_{args.mode}_epoch{epoch}.pth")
         torch.save(model.state_dict(), ckpt_path)
 
         #每轮落一次 loss 历史：中途停掉也不会丢曲线，续训时靠它接上
@@ -172,7 +255,7 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    train(parse_args())
 
 
 

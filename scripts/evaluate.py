@@ -6,7 +6,9 @@ import os
 import csv
 import re
 import json
+import glob
 import math
+import argparse
 import time
 from datetime import datetime
 import cv2
@@ -19,19 +21,64 @@ from scripts.train import build_model
 ROOT = r"D:\target_detection\data\VOCdevkit\VOC2012"       # VOC2012 根目录
 RUNS = r"D:\target_detection\runs"                         # checkpoint 目录（已 gitignore）
 OUT  = r"D:\target_detection\outputs"                      # 预测图输出目录（已 gitignore）
-#权重
-CKPT = os.path.join(RUNS, "fasterrcnn_resnet50_fpn_voc_head_epoch8.pth")
-
-#先在小规模上跑通
-QUICK_N =1000
+#权重：不再写死在文件里 —— 本轮要评估十几个 checkpoint（两组 × 7 个 epoch + 全量复核），
+#      写死的话每换一个就得改一次源码，抄错一次就白跑 15 分钟。改成命令行传入（见 parse_args）。
+DEFAULT_N = 1000        # 默认评估前 1000 张；--n 0 表示跑全量 5823 张
 
 
-def load_model(device):
+def parse_args():
+    ap = argparse.ArgumentParser(description="评估一个或多个 checkpoint 的 mAP（可批量）")
+    ap.add_argument("--ckpt", nargs="+", default=None,
+                    help="权重路径，支持通配（脚本内用 glob 展开，Windows 下不用依赖 shell）；"
+                         "与 --mode/--epochs 二选一")
+    ap.add_argument("--mode", default=None,
+                    help="显式指定实验名（full 那批 ckpt 的文件名里没有 mode 段，必须靠它区分）")
+    ap.add_argument("--epochs", type=int, nargs="*", default=None,
+                    help="配合 --mode 使用：--mode full --epochs 0 3 6 9 12 15 18")
+    ap.add_argument("--n", type=int, default=DEFAULT_N, help=f"评估前 n 张；0 = 全量（默认 {DEFAULT_N}）")
+    ap.add_argument("--no-vis", action="store_true", help="不画预测图（批量评估时省时间）")
+    return ap.parse_args()
+
+
+def ckpt_path_for(mode, epoch):
+    """按 mode + epoch 拼权重路径。
+
+    full 那批是 9/19 跑的，当时文件名还没加 mode 段（..._voc_epoch{N}.pth），
+    所以先试旧命名、再试现命名（..._voc_full_epoch{N}.pth）。
+    两种都不存在就直接报错 —— 静默跳过一个 epoch 会让 mAP-epoch 曲线缺个点还看不出来。
+    """
+    cands = []
+    if mode == "full":
+        cands.append(os.path.join(RUNS, f"fasterrcnn_resnet50_fpn_voc_epoch{epoch}.pth"))
+    cands.append(os.path.join(RUNS, f"fasterrcnn_resnet50_fpn_voc_{mode}_epoch{epoch}.pth"))
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"找不到 {mode} 的 epoch{epoch} 权重，试过：{cands}")
+
+
+def expand_ckpts(args):
+    """把 --ckpt（路径/通配）或 --mode + --epochs 统一展开成有序去重的路径列表。"""
+    if args.ckpt:
+        paths = []
+        for pat in args.ckpt:
+            hits = sorted(glob.glob(pat))
+            if not hits:
+                raise FileNotFoundError(f"--ckpt 没匹配到任何文件：{pat}")
+            paths.extend(hits)
+    elif args.mode and args.epochs:
+        paths = [ckpt_path_for(args.mode, e) for e in args.epochs]
+    else:
+        raise SystemExit("需要 --ckpt（路径或通配），或 --mode + --epochs 组合")
+    return sorted(set(paths))
+
+
+def load_model(device, ckpt):
     model = build_model(device=device)
-    model.load_state_dict(torch.load(CKPT,map_location=device))
+    model.load_state_dict(torch.load(ckpt,map_location=device))
     # map_location=device：权重里记的是保存时的设备，这里强制映射到当前设备，
     model.eval()
-    print(f"已加载权重: {CKPT}")
+    print(f"已加载权重: {ckpt}")
     return model
 
 def build_val_loader(n=None):
@@ -152,19 +199,23 @@ def _versions():
     return out
 
 
-def parse_mode_epoch(ckpt_path):
+def parse_mode_epoch(ckpt_path, mode_override=None):
     """从权重文件名里解析出【实验模式】和【轮次】，用于给产物文件命名。
 
-    fasterrcnn_resnet50_fpn_voc_head_epoch8.pth   -> ("head", 8)
-    fasterrcnn_resnet50_fpn_voc_epoch5.pth        -> ("unknown", 5)   # 旧命名没写模式，不猜
-    完全对不上                                      -> ("unknown", None)
+    fasterrcnn_resnet50_fpn_voc_head_lr5e3_epoch8.pth -> ("head_lr5e3", 8)
+    fasterrcnn_resnet50_fpn_voc_epoch5.pth            -> ("unknown", 5)   # 旧命名没写模式，不猜
+    完全对不上                                          -> ("unknown", None)
+
+    mode_override：显式指定模式名。full 那批旧命名解析出来是 "unknown"，
+    产物会全写成 metrics_unknown_*，两组实验事后根本分不开 —— 所以必须能用 --mode 覆盖。
     """
     name = os.path.basename(ckpt_path)
-    m = re.search(r"_voc_([A-Za-z]+)_epoch(\d+)\.pth$", name)
+    m = re.search(r"_voc_([A-Za-z0-9]+)_epoch(\d+)\.pth$", name)
     if m:
-        return m.group(1), int(m.group(2))
+        mode, epoch = m.group(1), int(m.group(2))
+        return (mode_override or mode), epoch
     m = re.search(r"epoch(\d+)\.pth$", name)
-    return "unknown", (int(m.group(1)) if m else None)
+    return (mode_override or "unknown"), (int(m.group(1)) if m else None)
 
 
 def collect_per_class(res_main,res_50):
@@ -276,64 +327,101 @@ def visualize(model,val_ds:VOCDataset,device,stems,score_thr = 0.5):
 
 
 def main():
+    args = parse_args()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = load_model(device)
-    val_ds,loader = build_val_loader(n=QUICK_N)
-    #先验证 preds 结构（拿一个 batch 看看，对不上就说明哪步错了）
-    #注意：必须包 no_grad。build_model 加载 COCO 权重后大部分参数 requires_grad=True，
-    #  不加的话这次前向会建一整张计算图，而 preds/p 会一直活到 main() 返回 ——
-    #  整轮评估期间那批中间激活都挂在显存里，8.5G 的卡上很容易 OOM。
-    images, _ = next(iter(loader))
-    with torch.no_grad():
-        preds = model([img.to(device) for img in images])
-        p = preds[0]
-        print("=== preds 结构 ===")
-        print("boxes ", tuple(p["boxes"].shape))         # [N,4]  N = 这张图检出的框数
-        print("labels", tuple(p["labels"].shape))        # [N]
-        print("scores", tuple(p["scores"].shape),
-              "| 单调递减?", bool(torch.all(p["scores"][:-1] >= p["scores"][1:])))  # 应 True
-    del preds, p, images        # 确认完就放掉：这批图 evaluate_map 还会再算一遍，没必要留着
 
-    #算map（一次遍历同时拿到 AP@0.5:0.95 与 AP@0.5 两个口径）
-    t0 = time.time()
-    res_main, res_50, n_eval = evaluate_map(model,loader,device)
-    elapsed = time.time() - t0
+    ckpts = expand_ckpts(args)
+    n_req = None if args.n == 0 else args.n      # 0 = 全量
+    print(f"待评估 {len(ckpts)} 个 checkpoint | n={n_req or '全量'}")
 
-    overall   = {new: _num(res_main[old]) for old,new in SCALAR_KEYS.items()}
-    per_class = collect_per_class(res_main,res_50)
+    val_ds, loader = build_val_loader(n=n_req)   # loader 只建一次，所有 ckpt 复用
+    rows = []
 
-    print("mAP@0.5      =", _fmt(overall["map_50"]))       # 主指标
-    print("mAP@0.5:0.95 =", _fmt(overall["map_50_95"]))
-    # 两个口径并排打印：以前只打一列还标成"每类 AP"，抄进报告很容易把 0.43 当成 AP@0.5
-    print("每类 AP（左 = AP@0.5，右 = AP@0.5:0.95）:")
-    for name,v in per_class.items():
-        print(f"  {name:12s} {_fmt(v['ap50'],3)}  {_fmt(v['ap50_95'],3)}")
+    for i, ckpt in enumerate(ckpts):
+        print(f"\n===== [{i+1}/{len(ckpts)}] {os.path.basename(ckpt)} =====")
+        model = load_model(device, ckpt)
 
-    #落盘：runs/metrics_{mode}.json + .csv，报告取数/溯源用
-    mode, epoch = parse_mode_epoch(CKPT)
-    meta = {
-        "checkpoint":      CKPT,                    # 这批数字是哪份权重跑出来的，必须能追溯
-        "checkpoint_file": os.path.basename(CKPT),
-        "mode":            mode,                    # head / full；解析不出就是 unknown
-        "epoch":           epoch,
-        "split":           "val",
-        "skip_difficult":  True,                    # 忽略 difficult=1 的框，与 VOC 官方口径一致
-        "n_images":        n_eval,                  # 实际评估张数
-        "n_images_total":  len(val_ds),             # 该划分总张数
-        "subset":          bool(QUICK_N and n_eval < len(val_ds)),
-        #                  ^ subset=True 表示只跑了前 n 张子集，报告里绝不能当成全量结果用
-        "batch_size":      loader.batch_size,
-        "device":          str(device),
-        "elapsed_sec":     round(elapsed,1),
-        "timestamp":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "versions":        _versions(),
-    }
-    json_path, csv_path = save_metrics(overall,per_class,meta)
-    print("已保存:", json_path)
-    print("已保存:", csv_path)
+        # 只在第一个 ckpt 上验一次 preds 结构：对每个权重都验纯属浪费
+        # 注意：必须包 no_grad。build_model 加载 COCO 权重后大部分参数 requires_grad=True，
+        #  不加的话这次前向会建一整张计算图，而 preds/p 会一直活到 main() 返回 ——
+        #  整轮评估期间那批中间激活都挂在显存里，8.5G 的卡上很容易 OOM。
+        if i == 0:
+            images, _ = next(iter(loader))
+            with torch.no_grad():
+                preds = model([img.to(device) for img in images])
+                p = preds[0]
+                print("=== preds 结构 ===")
+                print("boxes ", tuple(p["boxes"].shape))         # [N,4]  N = 这张图检出的框数
+                print("labels", tuple(p["labels"].shape))        # [N]
+                print("scores", tuple(p["scores"].shape),
+                      "| 单调递减?", bool(torch.all(p["scores"][:-1] >= p["scores"][1:])))  # 应 True
+            del preds, p, images    # 确认完就放掉：这批图 evaluate_map 还会再算一遍，没必要留着
 
-    #可视化
-    visualize(model,val_ds,device,val_ds.stems[:5])
+        #算map（一次遍历同时拿到 AP@0.5:0.95 与 AP@0.5 两个口径）
+        t0 = time.time()
+        res_main, res_50, n_eval = evaluate_map(model,loader,device)
+        elapsed = time.time() - t0
+
+        overall   = {new: _num(res_main[old]) for old,new in SCALAR_KEYS.items()}
+        per_class = collect_per_class(res_main,res_50)
+
+        print("mAP@0.5      =", _fmt(overall["map_50"]))       # 主指标
+        print("mAP@0.5:0.95 =", _fmt(overall["map_50_95"]))
+        # 两个口径并排打印：以前只打一列还标成"每类 AP"，抄进报告很容易把 0.43 当成 AP@0.5
+        print("每类 AP（左 = AP@0.5，右 = AP@0.5:0.95）:")
+        for name,v in per_class.items():
+            print(f"  {name:12s} {_fmt(v['ap50'],3)}  {_fmt(v['ap50_95'],3)}")
+
+        #落盘：runs/metrics_{mode}_e{epoch}_n{张数}.json + .csv，报告取数/溯源用
+        mode, epoch = parse_mode_epoch(ckpt, args.mode)
+        meta = {
+            "checkpoint":      ckpt,                    # 这批数字是哪份权重跑出来的，必须能追溯
+            "checkpoint_file": os.path.basename(ckpt),
+            "mode":            mode,                    # head_lr5e3 / full / head；解析不出就是 unknown
+            "epoch":           epoch,
+            "split":           "val",
+            "skip_difficult":  True,                    # 忽略 difficult=1 的框，与 VOC 官方口径一致
+            "n_images":        n_eval,                  # 实际评估张数
+            "n_images_total":  len(val_ds),             # 该划分总张数
+            "subset":          bool(n_req and n_eval < len(val_ds)),
+            #                  ^ subset=True 表示只跑了前 n 张子集，报告里绝不能当成全量结果用
+            "batch_size":      loader.batch_size,
+            "device":          str(device),
+            "elapsed_sec":     round(elapsed,1),
+            "timestamp":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "versions":        _versions(),
+        }
+        json_path, csv_path = save_metrics(overall,per_class,meta)
+        print("已保存:", json_path)
+        print("已保存:", csv_path)
+        rows.append({"mode": mode, "epoch": epoch, "n": n_eval, "ckpt": os.path.basename(ckpt),
+                     "map_50": overall["map_50"], "map_50_95": overall["map_50_95"],
+                     "elapsed": round(elapsed,1)})
+
+        #可视化只对第一个 ckpt 做：十几份权重画同样的 5 张图没有新信息，还覆盖同名文件
+        if not args.no_vis and i == 0:
+            visualize(model,val_ds,device,val_ds.stems[:5])
+
+        # 释放：下一个 ckpt 会重新 load_state_dict，但旧模型的显存要显式清掉才稳
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    print_summary(rows)
+
+
+def print_summary(rows):
+    """把所有 ckpt 的结果打成一张表。
+
+    为什么要在脚本里就汇总：14 次评估跑完，光看滚动日志根本比不出趋势，
+    而报告要的正是"同一张表里横着比"。这张表也是 plot_map_curve.py 的输入来源（读落盘 json）。
+    """
+    print("\n===== 本批汇总 =====")
+    print(f"{'mode':<12s}{'epoch':>6s}{'n':>7s}{'mAP@0.5':>10s}{'mAP@.5:.95':>12s}{'sec':>8s}")
+    for r in rows:
+        print(f"{str(r['mode']):<12s}{str(r['epoch']):>6s}{r['n']:>7d}"
+              f"{_fmt(r['map_50'],4):>10s}{_fmt(r['map_50_95'],4):>12s}{r['elapsed']:>8.1f}")
+
 
 if __name__ == "__main__":
     main()
