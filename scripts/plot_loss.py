@@ -86,7 +86,7 @@ def load_history(path):
 def summarize(epochs, hist):
     """把 4 个分量按 epoch 打成一张表，并给出首→末降幅。
 
-    图只能看趋势；写报告要的是具体数字（result.md 4.2 那张表就是这么来的）。
+    图只能看趋势；写报告要的是具体数字（report.md 6.2 节的 loss 表就是这么来的）。
     """
     print(f"{'epoch':>5s}  " + "".join(f"{k:>18s}" for k in KEYS))
     for h in hist:

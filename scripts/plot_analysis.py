@@ -20,7 +20,7 @@ ANN = os.path.join(ROOT, "Annotations")
 OUT = r"D:\target_detection\outputs"
 
 # 每类 AP@0.5:0.95（val 5823 张，5 epoch 全量微调，单次实验；来自 evaluate.py 输出）
-# 【别搞错口径】这 20 个数的均值 = 0.434，正好等于 result.md 4.1 的 mAP@0.5:0.95 ≈ 0.43，
+# 【别搞错口径】这 20 个数的均值 = 0.434，正好等于 report.md 4.3 节「前期工作」记录的全量结果 mAP@0.5:0.95 ≈ 0.434，
 #   所以它们是 AP@0.5:0.95，不是 AP@0.5（早期版本这里把它标成了 "AP@0.5"）。
 AP = {
     "aeroplane": 0.554, "bicycle": 0.439, "bird": 0.424, "boat": 0.330, "bottle": 0.371,
@@ -74,5 +74,5 @@ plt.close()
 print("已保存 fig_ap_by_class.png / fig_ap_vs_instances.png")
 print("train 实例数总和:", sum(counts))
 # 自检：逐类均值必然等于总体指标（两者都是"20 类求平均"）。
-# 如果这个数不等于 result.md 4.1 的 mAP@0.5:0.95，说明 AP 表被接到了另一个口径上。
+# 如果这个数不等于 report.md 4.3 节「前期工作」记录的 mAP@0.5:0.95，说明 AP 表被接到了另一个口径上。
 print(f"逐类 AP@0.5:0.95 均值 = {np.mean(aps):.4f}（应 ≈ 0.43）")

@@ -1,15 +1,38 @@
+"""DataLoader + collate_fn 的冒烟验证（D4 学习步骤留档）。
+
+用途
+----
+手动确认 VOCDataset 与 collate_fn 串起来之后，一个 batch 的形状 / dtype / 取值范围是否符合预期。
+这不是单元测试，只是打印式自检；正式验证建议改用 pytest（见 report.md 附录 D）。
+
+跑完应该看到
+------------
+    len(images) = 2
+    images[i]: shape=(3, H, W) dtype=torch.float32 范围=[0.00,1.00]
+    len(targets) = 2
+    targets[i]: boxes 与 labels 的第一维相等 = True
+    val batch 也 OK: 2 2
+
+为什么 NUM_WORKERS 必须是 0
+--------------------------
+Windows 下多进程走 spawn，配合共享内存曾有卡死风险（见 report.md 附录 D）。
+本脚本早期写成 2，是当时"先 0 跑通、再改 2 试多进程"的试验残留；
+现已改回 0，与 train.py / evaluate.py 保持一致 —— 否则这里跑通、那边卡死，最难查。
+
+为什么 collate_fn 从 VOC_dataset 导入，而不是在本文件里再定义一份
+--------------------------------------------------------------
+本项目早期 Dataset 与测试脚本各写了一份 collate_fn，改一处忘另一处就会造成
+"训练正常、评估错位"这类静默 bug。现统一由 scripts/VOC_dataset.py 提供唯一实现，
+本文件只 import，不再自带副本。
+"""
 import sys
 sys.path.insert(0, r"D:\target_detection")
 
 import torch
 from torch.utils.data import DataLoader
-from scripts.VOC_dataset import VOCDataset
+from scripts.VOC_dataset import VOCDataset, collate_fn   # collate_fn 的唯一实现在 VOC_dataset.py
 
-NUM_WORKERS = 2        # ← Step 6：先 0 跑通，再改 2 试多进程
-
-def collate_fn(batch):
-    images, targets = zip(*batch)         # 按样本分组 → 按字段分组
-    return list(images), list(targets)
+NUM_WORKERS = 0        # 见文件头说明：Windows 下必须 0，与 train.py / evaluate.py 一致
 
 if __name__ == "__main__":
     root = r"D:\target_detection\data\VOCdevkit\VOC2012"
@@ -33,4 +56,3 @@ if __name__ == "__main__":
 
     v_images, v_targets = next(iter(dl_val))
     print("val batch 也 OK:", len(v_images), len(v_targets))
-  

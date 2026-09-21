@@ -14,16 +14,17 @@
     python -m scripts.compare_per_class                       # 默认 n=1000，自动选每组的峰值 epoch
     python -m scripts.compare_per_class --n 5823              # 换评估规模
     python -m scripts.compare_per_class --pick last           # 改用"最后一个 epoch"而不是峰值
-    python -m scripts.compare_per_class --modes zero full head_lr5e3
+    python -m scripts.compare_per_class --modes zeroshot full head_lr5e3   # 换成 lr 消融那一路
 
 产物：
     runs/per_class_3way_n{n}.csv          逐类三方对照表
-    outputs/fig_per_class_delta_n{n}.png  横轴排序条形图，退化类标红
+    outputs/fig_per_class_delta_n{n}.png  逐类增益条形图（并排画 full−zero 与 head−zero）
 
 跑完应该看到（自检）：
     - 终端打印每个来源实际用了哪个 epoch 的哪份 json
     - 每组的"逐类均值"应该≈该组 overall 的 map_50（差 <0.001 才算对齐没错）
     - 退化类数量（gain < 0 的类）
+    - CSV 的三个 AP 列非空行数都应为 20（否则列名映射坏了，见 CSV_KEY 处的说明）
 """
 import os
 import json
@@ -41,10 +42,15 @@ OUT  = r"D:\target_detection\outputs"
 # 三个来源在脚本内部的代号 → 用于 CSV 列名和终端表头
 # 为什么用代号而不是直接用 mode 名：head 有两组（lr=0.001 和 0.005），
 #   报告里要按"角色"对比（零样本锚点 / 全参 / 只换头），不是按实验编号。
+# 2026-09-21 变更：head 角色由 head_lr5e3 改为 head（lr=1e-3）。
+#   原因：补跑 head(lr=1e-3) 全曲线后，它在 6 个指标中有 5 个优于 head_lr5e3
+#   （仅 mAP@0.5 低 0.7 点，但 mAP@0.75 高 4.9 点）——它才是"只换头"这一策略的
+#   正确代表。head_lr5e3 降级为学习率消融，其逐类结果可用
+#   `--modes zeroshot full head_lr5e3` 单独生成。
 ROLE_DEFAULT = {
     "zero": "zeroshot",     # 零样本：不训练，直接拿 COCO 权重评 VOC
     "full": "full",         # 全参微调：41.2M 参数全放开
-    "head": "head_lr5e3",   # 只换头：只训 box_predictor（0.26% 参数）
+    "head": "head",         # 只换头：只训 box_predictor（0.26% 参数），lr=1e-3
 }
 
 RED   = "#E24B4A"   # 退化（gain < 0）
@@ -63,7 +69,8 @@ def parse_args():
     ap.add_argument("--modes", nargs=3, default=None, metavar=("ZERO", "FULL", "HEAD"),
                     help=f"三个角色的 mode 名，默认 {list(ROLE_DEFAULT.values())}")
     ap.add_argument("--x", default="auto",
-                    help="横轴用哪个差值列：auto / gain_head / gain_full / delta_head_minus_full")
+                    help="画哪几条序列：auto（默认，画 full−zero 与 head−zero 两条）/ "
+                         "gain_head / gain_full / delta_head_minus_full（单条）")
     ap.add_argument("--runs", default=RUNS)
     ap.add_argument("--out", default=OUT)
     return ap.parse_args()
@@ -111,8 +118,8 @@ def pick_record(records, n, how):
     返回 dict 或 None（该 mode 在这个 n 下没有记录）
 
     为什么默认挑"峰值"而不是"最后一轮"：
-        全参微调实测是【单调下降】的（0.714→0.609）。如果硬报 epoch18，
-        等于拿对手的最差状态来比，结论会被质疑"你故意挑了个差 epoch"。
+        全参微调实测是【总体下降】的（0.714→0.609，中间有 ±2 点波动，非严格单调）。
+        如果硬报 epoch18，等于拿对手的最差状态来比，结论会被质疑"你故意挑了个差 epoch"。
         让每个配置都出现在自己的最好状态，比较才公平。
     """
     cand = [r for r in records if r["n"] == n]
@@ -218,42 +225,64 @@ def selfcheck(rows, recs):
 
 # ==== 5. 画图 ====
 
-def plot_delta(rows, xkey, n, out_dir, recs):
-    """横轴排序条形图：左端是"被训坏"的类，右端是"被训好"的类。
+def plot_delta(rows, xkeys, n, out_dir, recs):
+    """横轴排序条形图：同一类上并排画两条 —— 全参微调的增益 与 只换头的增益。
 
     为什么横着画：类名（pottedplant、diningtable）太长，竖着放会挤成一团。
-    """
-    data = [r for r in rows if r.get(xkey) is not None]
-    if not data:
-        print(f"  {xkey} 全为 None，跳过画图")
-        return None
-    data.sort(key=lambda r: r[xkey])
-    names = [r["name"] for r in data]
-    vals  = [r[xkey] for r in data]
-    colors = [RED if v < 0 else BLUE for v in vals]
 
-    fig, ax = plt.subplots(figsize=(9, 7.5))
-    bars = ax.barh(names, vals, color=colors, height=0.7)
+    为什么改成"双序列"而不是单序列（2026-09-21）：
+        原实现只画 --x 指定的那一列，默认是 gain_head。但报告 6.5 节要论证的
+        两件事分别需要两条序列 —— "全参微调的退化是全局的"（18/20 类为负）
+        和"只换头的增益接近于零且逐类有正有负"。只画一条时，另一条的结论
+        在图上没有依据，正文与图会对不上。两条并排后，"全参整体左移、只换头
+        贴着 0 线"这个对比一眼可见。
+
+    参数 xkeys: list[(key, 显示名, 颜色)]，按画图顺序
+    """
+    series = [(k, lab, col) for k, lab, col in xkeys]
+    data = [r for r in rows if any(r.get(k) is not None for k, _, _ in series)]
+    if not data:
+        print("  两条序列全为 None，跳过画图")
+        return None
+
+    # 排序键取第一条序列（full），它是本图的主线：让"退化最狠的类"排在底部
+    data.sort(key=lambda r: (1e9 if r.get(series[0][0]) is None else r[series[0][0]]))
+    names = [r["name"] for r in data]
+    m = len(series)
+    height = 0.8 / m
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for si, (key, lab, col) in enumerate(series):
+        vals = [r.get(key) for r in data]
+        # None 用 0 占位，但下标要偏移，否则缺数据的类上两根柱子会重叠
+        plot_vals = [0.0 if v is None else v for v in vals]
+        pos = [i + (si - (m - 1) / 2) * height for i in range(len(data))]
+        bars = ax.barh(pos, plot_vals, height=height * 0.92, color=col, label=lab)
+        for b, v in zip(bars, vals):
+            if v is None:
+                continue      # 缺数据不标数字：标 0 会被读成"该类增益为零"
+            ax.text(v + (0.004 if v >= 0 else -0.004), b.get_y() + b.get_height() / 2,
+                    f"{v:+.3f}", va="center", ha="left" if v >= 0 else "right", fontsize=6.5)
+
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names, fontsize=8.5)
     ax.axvline(0, color="#2C2C2A", lw=0.8)      # 0 线：左右即"变好/变坏"的分界
-    for b, v in zip(bars, vals):
-        ax.text(v + (0.004 if v >= 0 else -0.004), b.get_y() + b.get_height() / 2,
-                f"{v:+.3f}", va="center", ha="left" if v >= 0 else "right", fontsize=7)
 
     # 标题用英文：matplotlib 默认字体没有 CJK 字符，写中文会变成方块
     # 必须标 n 和 epoch：子集曲线与全量长得像但不是一个数，不标迟早混着引用
-    tag = "gain = finetuned - zero-shot" if xkey.startswith("gain") else "head - full"
-    ep  = " | ".join(f"{t}:ep{recs[t]['epoch']}" for t in ("zero", "full", "head")
-                     if recs.get(t) and recs[t]["epoch"] is not None)
-    ax.set_xlabel(tag)
-    ax.set_title(f"Per-class AP@0.5 {tag} | val n={n} | {ep}")
+    ep = " | ".join(f"{t}:ep{recs[t]['epoch']}" for t in ("zero", "full", "head")
+                    if recs.get(t) and recs[t]["epoch"] is not None)
+    ax.set_xlabel("AP@0.5 gain vs zero-shot (absolute AP)")
+    ax.set_title(f"Per-class AP@0.5 gain vs zero-shot | val n={n} | {ep}")
     ax.grid(axis="x", alpha=0.3)
-    ax.margins(x=0.12)
+    ax.margins(x=0.14)
+    ax.legend(fontsize=8.5, loc="lower right")
     plt.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"fig_per_class_delta_n{n}.png")
     plt.savefig(path, dpi=140)
     plt.close()
-    print(f"\n已保存 {path}（红色 = 微调后反而退化）")
+    print(f"\n已保存 {path}")
     return path
 
 
@@ -261,6 +290,32 @@ def plot_delta(rows, xkey, n, out_dir, recs):
 
 COLS = ["class_id", "name", "ap50_zero", "ap50_full", "ap50_head",
         "gain_full", "gain_head", "delta_head_minus_full"]
+
+# CSV 列名 -> rows 里实际使用的键名
+# 变量 CSV_KEY：dict[str, str]，把"给 Excel 看的列名"映射到"代码内部的角色名"
+#   例：{"ap50_zero": "zero", "ap50_full": "full", "ap50_head": "head"}
+# 为什么需要这层映射：列名带 ap50_ 前缀是为了让 CSV 自解释（导进 Excel 能看出这列是
+#   AP@0.5 而不是 AP@0.5:0.95），但 rows 里的键是 zero/full/head ——
+#   plot_delta 与 print_md 都按角色名取值，改键名会连带改坏两处。
+# 坑：直接拿列名当键用，前三列会【永远写空且不抛异常】。2026-09-21 之前的
+#   per_class_3way_n1000.csv 就是这个状态：gain 列有数、三个 AP 列全空白，
+#   导进 Excel 会被误读成"这三个配置没有逐类 AP"。已在本函数末尾加自检兜住。
+CSV_KEY = {"ap50_zero": "zero", "ap50_full": "full", "ap50_head": "head"}
+
+
+def _cell(row, col):
+    """取 row 中某一列的值并格式化成字符串。
+    # 方法签名 -> str
+    #   作用：统一 CSV 单元格的取值与格式化
+    #   关键参数：col 是 COLS 里的列名，经 CSV_KEY 映射后才去 row 里取
+    #   坑：None 必须写成空串，不能写 0 或 "n/a" ——
+    #       写 0 会被下游当成"该类 AP 为零"（真实含义是"没评到"）；
+    #       写 "n/a" 会把这列变成字符串列，Excel 里没法按数值排序。
+    """
+    v = row.get(CSV_KEY.get(col, col))
+    if v is None:
+        return ""
+    return f"{v:.4f}" if isinstance(v, float) else v
 
 
 def save_csv(rows, n, runs_dir):
@@ -272,9 +327,15 @@ def save_csv(rows, n, runs_dir):
         w = csv.writer(f)
         w.writerow(COLS)
         for r in ordered:
-            w.writerow(["" if r.get(c) is None else
-                        (f"{r[c]:.4f}" if isinstance(r[c], float) else r[c]) for c in COLS])
-    print(f"已保存 {path}")
+            w.writerow([_cell(r, c) for c in COLS])
+
+    # 自检：三个 AP 列各自至少要有一行非空。
+    # 为什么非查不可：列名映射错了，CSV 照样写得出来、不报任何错，
+    #   只是那几列静默全空 —— 唯一能发现它的就是这一行检查。
+    filled = {c: sum(1 for r in ordered if _cell(r, c) != "")
+              for c in ("ap50_zero", "ap50_full", "ap50_head")}
+    flag = "✓" if all(v > 0 for v in filled.values()) else "✗ 有整列为空，检查 CSV_KEY 映射"
+    print(f"已保存 {path}（AP 列非空行数：{filled}）{flag}")
     return path
 
 
@@ -329,14 +390,22 @@ def main():
     print(f"共 {len(rows)} 个类")
     selfcheck(rows, recs)
 
-    # ==== 横轴列：默认"只换头相对零样本的增益"，没有零样本就退回 head−full ====
-    xkey = args.x
-    if xkey == "auto":
-        xkey = "gain_head" if recs["zero"] is not None and recs["head"] is not None \
-               else "delta_head_minus_full"
-    print(f"\n横轴用 {xkey}")
+    # ==== 画哪几条序列 ====
+    # 默认（auto）画两条：全参微调相对零样本、只换头相对零样本 ——
+    #   报告 6.5 节的两个论点各需要一条（"全参退化是全局的" / "只换头增益≈0"），
+    #   只画一条会让正文与图对不上。
+    # 没有零样本时退回"只换头 − 全参"这一条（此时没有共同锚点，两者之差仍有意义）。
+    if args.x == "auto":
+        if all(recs[t] is not None for t in ("zero", "full", "head")):
+            series = [("gain_full", "full - zero-shot", RED),
+                      ("gain_head", "head - zero-shot", BLUE)]
+        else:
+            series = [("delta_head_minus_full", "head - full", BLUE)]
+    else:
+        series = [(args.x, args.x, BLUE)]
+    print("\n画序列：" + "  ".join(k for k, _, _ in series))
 
-    plot_delta(rows, xkey, args.n, args.out, recs)
+    plot_delta(rows, series, args.n, args.out, recs)
     save_csv(rows, args.n, args.runs)
     print_md(rows, args.n)
 
